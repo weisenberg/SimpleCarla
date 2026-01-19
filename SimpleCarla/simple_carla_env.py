@@ -8,16 +8,26 @@ import random
 from scenario_map import OpenDriveParser
 from traffic_manager import TrafficManager, EgoVehicle
 from traffic_lights import IntersectionController
+from rewards import RewardSignal
 
 class SimpleCarlaEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
-    def __init__(self, map_name="Town01", render_mode=None, enable_traffic=False, traffic_density="high", enable_ego=False):
+    def __init__(self, map_name="Town01", render_mode=None, enable_traffic=False, traffic_density="high", enable_ego=False, enable_pedestrians=False, pedestrian_density="mid", sensors=None):
         self.map_name = map_name
         self.render_mode = render_mode
         self.enable_traffic = enable_traffic
         self.traffic_density = traffic_density
         self.enable_ego = enable_ego
+        self.enable_pedestrians = enable_pedestrians
+        self.pedestrian_density = pedestrian_density
+        
+        # Sensor Config
+        self.sensors_config = sensors or {'lidar': True, 'collision': True, 'lane': True} # Default all on if not passed? Or off?
+        # User wants to add by arg, so default off if not in dict, but if 'sensors' is passed, respect it.
+        # run_env sets all to False by default if arg not present.
+        
+        self.reward_signal = RewardSignal()
         
         self.window = None
         self.clock = None
@@ -51,9 +61,9 @@ class SimpleCarlaEnv(gym.Env):
                 self.controllers.append(IntersectionController(jid, roads, self.parser))
         
         # Traffic Manager
-        # We always create TrafficManager if Traffic OR Ego is enabled, to manage the Ego Vehicle properly
+        # We always create TrafficManager if Traffic OR Ego OR Pedestrians is enabled
         self.traffic_manager = None
-        if self.enable_traffic or self.enable_ego:
+        if self.enable_traffic or self.enable_ego or self.enable_pedestrians:
             self.traffic_manager = TrafficManager(self.parser)
             
             # Pass lights info
@@ -67,6 +77,14 @@ class SimpleCarlaEnv(gym.Env):
                 if self.traffic_density == "low": count = 15
                 elif self.traffic_density == "mid": count = 35
                 self.traffic_manager.spawn_vehicles(count)
+            
+            if self.enable_pedestrians:
+                p_count = 20
+                if self.pedestrian_density == "low": p_count = 10
+                elif self.pedestrian_density == "high": p_count = 50
+                # Assuming TrafficManager has spawn_pedestrians
+                if hasattr(self.traffic_manager, 'spawn_pedestrians'):
+                    self.traffic_manager.spawn_pedestrians(p_count)
                 
             if self.enable_ego:
                 self._spawn_ego()
@@ -100,9 +118,26 @@ class SimpleCarlaEnv(gym.Env):
         scale_y = (self.screen_height - 2*self.margin) / world_h if world_h > 0 else 1.0
         self.pixels_per_meter = min(scale_x, scale_y)
 
+        # RL Config
+        self.lidar_rays = 36
+        self.lidar_range = 50.0
+
+        # Visualization State
+        self.latest_reward = 0.0
+        self.total_reward = 0.0 # Track cumulative
+        self.latest_info = {}
+        self.latest_lidar = np.zeros((self.lidar_rays,), dtype=np.float32)
+
         # Placeholder Action/Obs (Modified observation space from snippet)
         self.action_space = spaces.Discrete(5)
-        self.observation_space = spaces.Box(low=0, high=255, shape=(self.screen_height, self.screen_width, 3), dtype=np.uint8)
+        self.observation_space = spaces.Dict({
+            'minimap': spaces.Box(low=0, high=255, shape=(self.screen_height, self.screen_width, 3), dtype=np.uint8),
+            'lidar': spaces.Box(low=0.0, high=self.lidar_range, shape=(self.lidar_rays,), dtype=np.float32),
+            'speed': spaces.Box(low=0, high=100, shape=(1,), dtype=np.float32),
+            'steering': spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32),
+            'lateral_error': spaces.Box(low=-100, high=100, shape=(1,), dtype=np.float32),
+            'heading_error': spaces.Box(low=-3.14, high=3.14, shape=(1,), dtype=np.float32)
+        })
 
     def _spawn_ego(self):
         # Spawn EGO
@@ -120,6 +155,9 @@ class SimpleCarlaEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+        self.reward_signal.reset()
+        self.total_reward = 0.0
+        
         # Reset traffic if enabled (from snippet)
         if self.traffic_manager:
             self.traffic_manager.vehicles = []
@@ -129,11 +167,20 @@ class SimpleCarlaEnv(gym.Env):
                 elif self.traffic_density == "mid": count = 35
                 self.traffic_manager.spawn_vehicles(count)
             
+            if self.enable_pedestrians and hasattr(self.traffic_manager, 'spawn_pedestrians'):
+                 if hasattr(self.traffic_manager, 'pedestrians'):
+                     self.traffic_manager.pedestrians = []
+                 
+                 p_count = 20
+                 if self.pedestrian_density == "low": p_count = 10
+                 elif self.pedestrian_density == "high": p_count = 50
+                 self.traffic_manager.spawn_pedestrians(p_count)
+
             if self.enable_ego:
                 self._spawn_ego()
                 
         # Return observation matching new observation space
-        return np.zeros((self.screen_height, self.screen_width, 3), dtype=np.uint8), {}
+        return self._get_obs(), {}
 
     def step(self, action):
         dt = 1.0/self.metadata["render_fps"]
@@ -152,8 +199,436 @@ class SimpleCarlaEnv(gym.Env):
         for c in self.controllers:
             c.update(dt)
             
-        # Return observation matching new observation space
-        return np.zeros((self.screen_height, self.screen_width, 3), dtype=np.uint8), 0.0, False, False, {}
+        # RL Physics / Metrics
+        obs = self._get_obs()
+        
+        # Lane Metrics (Flag Check)
+        lane_type = 'none'
+        lat_err = 0.0
+        head_err = 0.0
+        
+        if self.sensors_config.get('lane', False):
+            if self.ego_vehicle:
+                # Reuse from Obs if available, else recompute
+                if 'lateral_error' in obs:
+                     lat_err = float(obs['lateral_error'][0])
+                     head_err = float(obs['heading_error'][0])
+                lane_type, _, _ = self._get_lane_metrics()
+
+        # Collision Check (Flag Check)
+        is_collision = False 
+        try:
+             if self.enable_ego and self.ego_vehicle and self.sensors_config.get('collision', False):
+                 # Vehicles
+                 for v in self.traffic_manager.vehicles:
+                     if v is not self.ego_vehicle:
+                         vx, vy, _ = v.get_position()
+                         dx = vx - self.ego_vehicle.x
+                         dy = vy - self.ego_vehicle.y
+                         # Vehicle Radius ~2m + Ego Radius ~2m = 4m threshold. Sq = 16.
+                         if dx*dx + dy*dy < 16.0: 
+                             is_collision = True
+                             break
+                 
+                 # Pedestrians (Added)
+                 if not is_collision and hasattr(self.traffic_manager, 'pedestrians'):
+                     for p in self.traffic_manager.pedestrians:
+                         dx = p.x - self.ego_vehicle.x
+                         dy = p.y - self.ego_vehicle.y
+                         # Ped Radius ~0.5m + Ego Radius ~2m = 2.5m threshold. Sq = 6.25.
+                         if dx*dx + dy*dy < 6.25:
+                             is_collision = True
+                             break
+        except Exception as e:
+             # print(f"Collision Check Error: {e}")
+             pass
+
+        # Lead Distance Calculation
+        dist_lead = 100.0
+        if self.ego_vehicle:
+            # Simple cone check or distance check in front
+            # Vector: (cos(h), sin(h))
+            ex, ey, eh = self.ego_vehicle.get_position()
+            vx, vy = math.cos(eh), math.sin(eh)
+            
+            # Check Vehicles
+            if self.traffic_manager:
+                for v in self.traffic_manager.vehicles:
+                    if v is not self.ego_vehicle:
+                        tx, ty, _ = v.get_position()
+                        dx, dy = tx - ex, ty - ey
+                        
+                        # Project onto heading vector
+                        proj = dx * vx + dy * vy
+                        
+                        # Must be in front (proj > 0) and within cone (perp dist)
+                        if proj > 0 and proj < dist_lead:
+                            perp = abs(-vy * dx + vx * dy) # Cross product
+                            if perp < 2.0: # Within lane width approx
+                                dist_lead = proj
+                
+                # Check Pedestrians (radius 0.5)
+                if hasattr(self.traffic_manager, 'pedestrians'):
+                    for p in self.traffic_manager.pedestrians:
+                        dx, dy = p.x - ex, p.y - ey
+                        proj = dx * vx + dy * vy
+                        if proj > 0 and proj < dist_lead:
+                            perp = abs(-vy * dx + vx * dy)
+                            if perp < 1.5: # Pedestrian can be narrower
+                                dist_lead = proj - 0.5 # Surface distance
+            
+        is_off_road = (lane_type == 'none')
+        is_red_light = self._check_red_light()
+        
+        info = {
+            'speed': self.ego_vehicle.speed if self.ego_vehicle else 0.0,
+            'is_collision': is_collision,
+            'is_off_road': is_off_road,
+            'lane_type': lane_type,
+            'is_red_light': is_red_light,
+            'distance_to_lead': dist_lead,
+            'lateral_error': lat_err,
+            'heading_error': head_err
+        }
+        
+        # Reward
+        reward, terminated, truncated = self.reward_signal.compute(info, dt)
+        
+        # Store for Visualization
+        self.latest_reward = reward
+        self.total_reward += reward
+        self.latest_info = info
+        self.latest_lidar = obs.get('lidar', np.zeros((self.lidar_rays,), dtype=np.float32))
+        
+        return obs, reward, terminated, truncated, info
+
+    def _point_in_polygon(self, x, y, poly):
+        # Ray casting algorithm
+        if not poly: return False
+        n = len(poly)
+        inside = False
+        p1x, p1y = poly[0]
+        for i in range(n + 1):
+            p2x, p2y = poly[i % n]
+            if y > min(p1y, p2y):
+                if y <= max(p1y, p2y):
+                    if x <= max(p1x, p2x):
+                        if p1y != p2y:
+                            xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                        if p1x == p2x or x <= xinters:
+                            inside = not inside
+            p1x, p1y = p2x, p2y
+        return inside
+
+    def _get_lane_metrics(self):
+        if not self.ego_vehicle: return 'none', 0.0, 0.0
+        
+        x, y, h = self.ego_vehicle.get_position()
+        
+        # 1. Find the Lane Polygon we are in
+        best_lane = None
+        
+        for lane in self.parser.lanes:
+            if not lane.left_boundary: continue
+            
+            # Check if point inside polygon
+            poly = lane.get_polygon()
+            if self._point_in_polygon(x, y, poly):
+                best_lane = lane
+                break
+        
+        if not best_lane:
+             return 'none', 10.0, 0.0 # Off road
+             
+        # 2. Compute Metrics relative to Center Line
+        # Lane Center Line = Average of Left and Right boundaries.
+        # Find closest segment.
+        
+        min_dist = 1000.0
+        lat_err = 0.0
+        lane_heading = 0.0
+        
+        pts_l = best_lane.left_boundary
+        pts_r = best_lane.right_boundary
+        count = min(len(pts_l), len(pts_r))
+        
+        for i in range(count - 1):
+            # Segment Center Points
+            p0 = ((pts_l[i][0] + pts_r[i][0])/2, (pts_l[i][1] + pts_r[i][1])/2)
+            p1 = ((pts_l[i+1][0] + pts_r[i+1][0])/2, (pts_l[i+1][1] + pts_r[i+1][1])/2)
+            
+            # Distance from Point (x,y) to Line Segment (p0, p1)
+            # Project (x,y) onto line p0->p1
+            px, py = p1[0]-p0[0], p1[1]-p0[1]
+            norm = px*px + py*py
+            if norm == 0: continue
+            
+            u = ((x - p0[0]) * px + (y - p0[1]) * py) / norm
+            
+            # Clamp u to segment [0, 1]
+            u_clamped = max(min(u, 1), 0)
+            
+            # Closest point
+            cx = p0[0] + u * px
+            cy = p0[1] + u * py
+            
+            dx = x - cx
+            dy = y - cy
+            dist = math.sqrt(dx*dx + dy*dy)
+            
+            if dist < min_dist:
+                min_dist = dist
+                
+                # Determine sign of lateral error (Cross Product)
+                # Global heading of road
+                road_h = math.atan2(py, px)
+                
+                # Cross product (2D): A x B = AxBy - AyBx
+                # Vector Road: (px, py)
+                # Vector Center->Ego: (dx, dy) = (x-cx, y-cy)
+                cross = px * dy - py * dx
+                
+                # If cross > 0, Ego is Left of road msg -> LatErr +
+                lat_err = min_dist if cross > 0 else -min_dist
+                
+                # Heading Error
+                # Check Driving Direction.
+                # If best_lane.id > 0 (Left Lane), it drives AGAINST geometry indices.
+                # So Road Heading is opposite of segment vector.
+                
+                # OpenDrive: Right lanes (ID < 0) move with geometry (0->N).
+                # Left lanes (ID > 0) move against geometry (N->0).
+                
+                heading_ref = road_h
+                if best_lane.id > 0: # Left Lane
+                    heading_ref += math.pi
+                    
+                diff = h - heading_ref
+                while diff > math.pi: diff -= 2*math.pi
+                while diff < -math.pi: diff += 2*math.pi
+                
+                head_err = diff
+                lane_heading = heading_ref
+
+        return best_lane.type, lat_err, head_err
+
+    def _check_red_light(self):
+        # Determine if Ego is approaching a RED light
+        if not self.ego_vehicle: return False
+        if not self.controllers: return False
+        
+        x, y, h = self.ego_vehicle.get_position()
+        
+        # Optimize: Check distance to all TrafficLights
+        for c in self.controllers:
+            # Flatten lights from groups
+            for group in c.groups:
+                for light in group:
+                    # light.pos is (x, y, heading)
+                    lx, ly = light.pos[0], light.pos[1]
+                    dist = math.sqrt((x-lx)**2 + (y-ly)**2)
+                    
+                    if dist < 15.0: # Approaching
+                        if light.state == 'RED': # Uppercase "RED" from traffic_lights.py
+                             return True
+        return False
+        
+        if not best_lane:
+             return 'none', 10.0, 0.0 # Off road
+             
+        # 2. Compute Metrics relative to Center Line
+        # Lane Center Line = Average of Left and Right boundaries.
+        # Find closest segment.
+        
+        min_dist = 1000.0
+        lat_err = 0.0
+        lane_heading = 0.0
+        
+        pts_l = best_lane.left_boundary
+        pts_r = best_lane.right_boundary
+        count = min(len(pts_l), len(pts_r))
+        
+        for i in range(count - 1):
+            # Segment Center Points
+            p0 = ((pts_l[i][0] + pts_r[i][0])/2, (pts_l[i][1] + pts_r[i][1])/2)
+            p1 = ((pts_l[i+1][0] + pts_r[i+1][0])/2, (pts_l[i+1][1] + pts_r[i+1][1])/2)
+            
+            # Distance from Point (x,y) to Line Segment (p0, p1)
+            # Project (x,y) onto line p0->p1
+            px, py = p1[0]-p0[0], p1[1]-p0[1]
+            norm = px*px + py*py
+            if norm == 0: continue
+            
+            u = ((x - p0[0]) * px + (y - p0[1]) * py) / norm
+            
+            # Clamp u to segment [0, 1]
+            u_clamped = max(min(u, 1), 0)
+            
+            # Closest point
+            cx = p0[0] + u * px
+            cy = p0[1] + u * py
+            
+            dx = x - cx
+            dy = y - cy
+            dist = math.sqrt(dx*dx + dy*dy)
+            
+            if dist < min_dist:
+                min_dist = dist
+                
+                # Determine sign of lateral error (Cross Product)
+                # Global heading of road
+                road_h = math.atan2(py, px)
+                
+                # Cross product of (Road Dir) x (Ego->Center) ?
+                # Or simply:
+                # Lat Err is positive if we are to the LEFT of the center line?
+                # Transform Ego pos to Road Frame?
+                
+                # Cross product (2D): A x B = AxBy - AyBx
+                # Vector Road: (px, py)
+                # Vector Center->Ego: (dx, dy) = (x-cx, y-cy)
+                cross = px * dy - py * dx
+                
+                # If cross > 0, Ego is Left of road msg -> LatErr +
+                lat_err = min_dist if cross > 0 else -min_dist
+                
+                # Heading Error
+                # Check Driving Direction.
+                # If best_lane.id > 0 (Left Lane), it drives AGAINST geometry indices.
+                # So Road Heading is opposite of segment vector.
+                
+                # OpenDrive: Right lanes (ID < 0) move with geometry (0->N).
+                # Left lanes (ID > 0) move against geometry (N->0).
+                
+                heading_ref = road_h
+                if best_lane.id > 0: # Left Lane
+                    heading_ref += math.pi
+                    # Also, Lateral Error definition might flip?
+                    # Let's keep "Left of driving direction" as positive.
+                    # If driving backwards, cross product needs check.
+                    # Let's trust geometric left for now.
+                    
+                diff = h - heading_ref
+                # Normalize to [-pi, pi]
+                while diff > math.pi: diff -= 2*math.pi
+                while diff < -math.pi: diff += 2*math.pi
+                
+                # Re-Check Lat Error Sign for Left Lane
+                # If driving South, and we are East (Left) of center, lat err should be +?
+                # Usually standard: Cross Track Error.
+                # Let's stick to geometric cross product.
+                
+                head_err = diff
+                lane_heading = heading_ref
+
+        # Handle 'shoulder' type as bad? Yes, it's 'shoulder'.
+        return best_lane.type, lat_err, head_err
+
+    def _compute_lidar(self):
+        if not self.ego_vehicle or not self.sensors_config.get('lidar', False):
+            return np.zeros((self.lidar_rays,), dtype=np.float32)
+            
+        x, y, h = self.ego_vehicle.get_position()
+        ranges = np.ones((self.lidar_rays,), dtype=np.float32) * self.lidar_range
+        
+        # Ray casting
+        # Optimize: Check against Bounding Circles of Vehicles
+        # Ego Obstacles: Traffic + Pedestrians
+        obstacles = []
+        if self.traffic_manager:
+            for v in self.traffic_manager.vehicles:
+                if v is not self.ego_vehicle:
+                    vx, vy, _ = v.get_position()
+                    obstacles.append({'x': vx, 'y': vy, 'r': 2.5}) 
+            for p in self.traffic_manager.pedestrians:
+                obstacles.append({'x': p.x, 'y': p.y, 'r': 0.5})
+        
+        if not obstacles:
+             return ranges
+             
+        # Cast Rays
+        # FOV: 360 degrees?
+        for i in range(self.lidar_rays):
+            angle = h + (i / self.lidar_rays) * 2 * math.pi
+            rx = math.cos(angle)
+            ry = math.sin(angle)
+            
+            min_d = self.lidar_range
+            
+            # Intersection with Circles
+            # Ray: P = O + t*D
+            # Circle: |P - C|^2 = R^2
+            # |O + t*D - C|^2 = R^2
+            # Let L = C - O
+            # |t*D - L|^2 = R^2
+            # t^2 |D|^2 - 2t(D.L) + |L|^2 - R^2 = 0
+            # |D|=1. t^2 - 2t(D.L) + |L|^2 - R^2 = 0
+            # Quadratic: at^2 + bt + c = 0
+            # a = 1
+            # b = -2(D.L)
+            # c = |L|^2 - R^2
+            
+            for obs in obstacles:
+                lx = obs['x'] - x
+                ly = obs['y'] - y
+                
+                # Quick bounding box/distance check
+                l_sq = lx*lx + ly*ly
+                if l_sq > (self.lidar_range + obs['r'])**2:
+                    continue
+                    
+                b = -2 * (rx * lx + ry * ly)
+                c = l_sq - obs['r']**2
+                
+                delta = b*b - 4*c
+                if delta >= 0:
+                    sqrt_delta = math.sqrt(delta)
+                    # Two solutions: t1, t2
+                    t1 = (-b - sqrt_delta) / 2
+                    t2 = (-b + sqrt_delta) / 2
+                    
+                    t = min(t1, t2)
+                    if t < 0: t = max(t1, t2)
+                    
+                    if t > 0 and t < min_d:
+                        min_d = t
+            
+            ranges[i] = min_d
+            
+        return ranges
+
+    def _get_obs(self):
+        img = np.zeros((self.screen_height, self.screen_width, 3), dtype=np.uint8)
+        if self.render_mode == "rgb_array":
+             img = self.render()
+        
+        # Lidar Logic
+        lidar = self._compute_lidar()
+        
+        spd = 0.0
+        steer = 0.0
+        lat_err = 0.0
+        head_err = 0.0
+        
+        if self.ego_vehicle:
+            # Refresh pos from free roam state (ensure updated)
+            ego_v = self.ego_vehicle
+            spd = ego_v.speed
+            steer = ego_v.steering
+            
+            if self.sensors_config.get('lane', False):
+                lt, le, he = self._get_lane_metrics()
+                lat_err = le
+                head_err = he
+            
+        return {
+            'minimap': img,
+            'lidar': lidar,
+            'speed': np.array([spd], dtype=np.float32),
+            'steering': np.array([steer], dtype=np.float32),
+            'lateral_error': np.array([lat_err], dtype=np.float32),
+            'heading_error': np.array([head_err], dtype=np.float32)
+        }
 
     def render(self):
         if self.window is None and self.render_mode == "human":
@@ -184,7 +659,7 @@ class SimpleCarlaEnv(gym.Env):
             sy = self.screen_height - ((y - self.min_y) * self.pixels_per_meter + self.margin)
             return int(sx), int(sy)
             
-        self._draw_world(canvas, to_screen_global) # Use helper to draw world
+        self._draw_world(canvas, to_screen_global, self.pixels_per_meter) # Use helper to draw world
 
         # --- View 2: Ego Centric (Right) ---
         if self.enable_ego and self.ego_vehicle:
@@ -228,7 +703,8 @@ class SimpleCarlaEnv(gym.Env):
             
             # Set clip for drawing
             canvas.set_clip(right_rect)
-            self._draw_world(canvas, to_screen_ego, ego_mode=True)
+            self._draw_world(canvas, to_screen_ego, ppm_ego, ego_mode=True)
+            self._draw_lidar(canvas, to_screen_ego, ego_mode=True) # Draw Lidar in Ego View
             canvas.set_clip(None) # Reset clip
             
             # Draw Separator
@@ -260,6 +736,9 @@ class SimpleCarlaEnv(gym.Env):
             p_r = (mx + math.cos(h_r) * size, my - math.sin(h_r) * size)
             
             pygame.draw.polygon(canvas, (0, 255, 255), [tip, p_l, p_r]) # Cyan Triangle
+
+        # Draw HUD (Always on top)
+        self._draw_hud(canvas)
             
         if self.render_mode == "human":
             self.window.blit(canvas, (0, 0))
@@ -272,7 +751,7 @@ class SimpleCarlaEnv(gym.Env):
                 np.array(pygame.surfarray.pixels3d(canvas)), axes=(1, 0, 2)
             )
 
-    def _draw_world(self, canvas, to_screen_func, ego_mode=False):
+    def _draw_world(self, canvas, to_screen_func, ppm, ego_mode=False):
         # Draw Lanes (Polygons) (Modified from snippet)
         for lane in self.parser.lanes:
             poly = lane.get_polygon()
@@ -350,6 +829,17 @@ class SimpleCarlaEnv(gym.Env):
                  radius = 3 if not ego_mode else 6 # Larger in Ego View
                  pygame.draw.circle(canvas, color, (sx, sy), radius)
 
+        # Draw Pedestrians (NEW)
+        if self.traffic_manager and hasattr(self.traffic_manager, 'pedestrians'):
+             for p in self.traffic_manager.pedestrians:
+                 px, py = p.x, p.y
+                 sx, sy = to_screen_func(px, py)
+                 # Color
+                 col = (0, 255, 255) # Cyan
+                 if p.mode == "CROSSING": col = (255, 0, 255) # Magenta for Jaywalking
+                 
+                 pygame.draw.circle(canvas, col, (sx, sy), 3 if not ego_mode else 5)
+
         # Draw Vehicles (Added from snippet)
         if self.traffic_manager:
             for v in self.traffic_manager.vehicles:
@@ -357,44 +847,16 @@ class SimpleCarlaEnv(gym.Env):
                 sx, sy = to_screen_func(vx, vy)
                 
                 # Size
-                # In Ego Mode: Scale size by PPM_EGO?
-                # to_screen_func handles position. But size needs manual scaling used.
-                # Re-calculate PPM from coordinate delta?
-                # Or just pass PPM. 
-                # Let's derive rough PPM from transforming (0,0) and (1,0) distance.
-                p0 = to_screen_func(0,0)
-                p1 = to_screen_func(1,0)
-                current_ppm = math.hypot(p1[0]-p0[0], p1[1]-p0[1])
+                # Use passed PPM logic to avoid jerky integer snapping
                 
-                w = v.width * current_ppm
-                l = v.length * current_ppm
+                w = v.width * ppm
+                l = v.length * ppm
                 
                 # Create rect
                 surf = pygame.Surface((l, w), pygame.SRCALPHA)
                 surf.fill(v.color)
                 
                 # Rotate
-                # Heading h is in radians. Pygame rotate is degrees counter-clockwise.
-                
-                # GLOBAL VIEW:
-                # Rot degrees = math.degrees(vh)
-                
-                # EGO VIEW:
-                # The whole world is rotated by (Pi/2 - EgoH).
-                # Vehicle heading relative to world is still vh.
-                # So relative to screen: vh + (Pi/2 - EgoH).
-                # Wait, canvas rotation adds.
-                
-                # Let's verify:
-                # Ego Vehicle in Global: Heading North (Pi/2). Rot = 90. Point Up. Correct.
-                # Ego Vehicle in Ego View:
-                #   World Rot = Pi/2 - Pi/2 = 0.
-                #   Ego V Heading = Pi/2. Screen Heading = 90. Points Up. Correct.
-                
-                # Other Vehicle East (0).
-                #   World Rot = 0.
-                #   Other V Heading = 0. Screen Heading = 0. Points Right. Correct.
-                
                 # So we just rotate surf by `vh + rotation_rad`?
                 # Yes? Let's try.
                 
@@ -414,6 +876,95 @@ class SimpleCarlaEnv(gym.Env):
                 if isinstance(v, EgoVehicle):
                      # Draw white outline rect
                      pygame.draw.rect(canvas, (255, 255, 255), rect, 2)
+
+    def _draw_lidar(self, canvas, to_screen_func, ego_mode=False):
+        if not self.ego_vehicle: return
+        
+        # Get Lidar Data
+        ranges = self.latest_lidar
+        if ranges is None or len(ranges) == 0:
+             print("DEBUG: Lidar ranges empty or None")
+             return
+        
+        # DEBUG CHECK
+        # print(f"DEBUG: Drawing Lidar {len(ranges)} rays. Sample: {ranges[0]:.2f}")
+        
+        x, y, h = self.ego_vehicle.get_position()
+        sx, sy = to_screen_func(x, y)
+        
+        # Draw Rays
+        # N Rays distributed over 360 deg
+        n = len(ranges)
+        
+        for i in range(n):
+            dist = ranges[i]
+            
+            # Angle
+            # Same logic as _compute_lidar
+            angle = h + (i / n) * 2 * math.pi
+            
+            # End Point in World
+            ex = x + dist * math.cos(angle)
+            ey = y + dist * math.sin(angle)
+            
+            # Screen Coords
+            esx, esy = to_screen_func(ex, ey)
+            
+            # Color
+            # Green if max range (no hit), Red if hit
+            color = (0, 255, 0)
+            if dist < self.lidar_range - 0.1:
+                color = (255, 0, 0)
+                
+            # Draw line
+            pygame.draw.line(canvas, color, (sx, sy), (esx, esy), 1)
+            
+            # Draw dot at hit
+            if dist < self.lidar_range - 0.1:
+                 pygame.draw.circle(canvas, (255, 255, 0), (esx, esy), 2)
+
+    def _draw_hud(self, canvas):
+        if not pygame.font.get_init():
+            pygame.font.init()
+            
+        font = pygame.font.SysFont("Arial", 18)
+        
+        info = self.latest_info
+        if not info:
+             # Draw Waiting text?
+             # print("DEBUG: No INFO for HUD")
+             pass
+        
+        # Lines to display
+        # Use defaults if info missing
+        lines = [
+            f"Speed: {info.get('speed', 0):.1f} m/s" if info else "Speed: N/A",
+            f"Crash: {info.get('is_collision', False)}" if info else "Crash: N/A",
+            f"Reward: {self.total_reward:.2f}", # Show Cumulative
+            f"Step Raw: {self.latest_reward:.2f}", # Show Raw Step
+            f"Time Left: {self.reward_signal.max_episode_duration - self.reward_signal.current_episode_duration:.1f} s",
+            f"Lane Type: {info.get('lane_type', 'none')}" if info else "Lane: N/A",
+            f"Lat Err: {info.get('lateral_error', 0):.2f} m" if info else "Lat Err: N/A"
+        ]
+        
+        # Draw on Right Side (Ego View Overlay)
+        x = self.screen_width // 2 + 20
+        y = 20
+        
+        # Background Box
+        bg_rect = pygame.Rect(x-10, y-10, 200, len(lines)*25 + 20)
+        s = pygame.Surface((bg_rect.w, bg_rect.h))
+        s.set_alpha(180)
+        s.fill((0, 0, 0))
+        canvas.blit(s, bg_rect)
+        
+        try:
+             for line in lines:
+                 text = font.render(line, True, (255, 255, 255))
+                 canvas.blit(text, (x, y))
+                 y += 25
+        except Exception as e:
+             print(f"HUD Error: {e}")
 
 
     def close(self):

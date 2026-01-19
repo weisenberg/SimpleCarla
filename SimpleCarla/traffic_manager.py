@@ -106,7 +106,8 @@ class EgoVehicle(Vehicle):
         super().__init__(v_id, lane, s, speed, config)
         self.color = (0, 255, 0) # Green
         self.throttle = 0.0 
-        self.steering = 0.0 # -1.0 (Left) to 1.0 (Right)
+        self.steering = 0.0 # -1.0 (Left) to 1.0 (Right) (Target)
+        self.current_steering = 0.0 # Smoothed value
         
         # Free Roam State
         # Calculate initial x, y, h from lane/s
@@ -136,35 +137,130 @@ class EgoVehicle(Vehicle):
         if self.speed > 40.0: self.speed = 40.0
         if self.speed < -15.0: self.speed = -15.0 
         
-        # Steering (Yaw Rate)
-        # Max steering angle roughly 45 deg? 
-        # yaw_rate = (speed / wheelbase) * tan(steer_angle)
-        # Let's simplify: Turn Rate proportional to steering & speed
-        # But allow turning when slow too? No, cars need speed to turn.
+        # Smooth Steering
+        # Move current_steering towards self.steering
+        steer_speed = 3.0 # Full turn in ~0.33s
+        diff = self.steering - self.current_steering
+        max_change = steer_speed * dt
+        if abs(diff) < max_change:
+            self.current_steering = self.steering
+        else:
+            self.current_steering += max_change * (1 if diff > 0 else -1)
         
+        # Steering (Yaw Rate)
         wheelbase = 3.0 # Approx
         max_steer_angle = math.radians(40)
-        steer_angle = self.steering * max_steer_angle
+        steer_angle = self.current_steering * max_steer_angle
         
         # Small speed threshold to avoid jitter at 0
         if abs(self.speed) > 0.1:
-            # Kinematic Bicycle
-            # beta = atan( l_r / l * tan(delta) ) ? Assuming Center of Mass.
-            # Simplified: dH/dt = (v / L) * tan(delta)
-            
             yaw_rate = (self.speed / wheelbase) * math.tan(steer_angle)
             self.h += yaw_rate * dt
         
         # Update Position
         self.x += self.speed * math.cos(self.h) * dt
         self.y += self.speed * math.sin(self.h) * dt
+
+
+class Pedestrian:
+    def __init__(self, p_id, lane):
+        self.id = p_id
+        self.lane = lane
+        self.s = random.uniform(0, len(lane.left_boundary)-1)
+        self.direction = random.choice([1, -1])
         
-        # Note: We ignore 'lane' and 's' updates for Ego.
-        # This means interactions with TrafficManager (lead vehicle) might break
-        # if TrafficManager relies on 'lane' to find neighbors.
-        # For now, we accept Ego is "Ghost" or we need to map-match.
-        # Given "Free Roam", we likely accept Ghost for now.
+        # State
+        self.mode = "SIDEWALK" # SIDEWALK, CROSSING
+        self.mode_timer = random.uniform(5.0, 15.0)
         
+        # Position (derived from s + offset)
+        self.offset = 3.5 # 3.5m from center (Sidewalk/Shoulder)
+        self.x = 0
+        self.y = 0
+        self._update_pos()
+        
+    def _update_pos(self):
+        # Calculate x,y based on lane, s, and offset
+        # Similar to Vehicle.get_position logic but adding offset
+        pts = self.lane.left_boundary
+        max_s = len(pts) - 1.0
+        draw_s = max(0.0, min(self.s, max_s))
+        idx = int(draw_s)
+        if idx >= len(pts) - 1: idx = len(pts) - 2
+        
+        # Get Center Chord
+        pl0 = self.lane.left_boundary[idx]
+        pr0 = self.lane.right_boundary[idx]
+        p0 = ((pl0[0]+pr0[0])/2, (pl0[1]+pr0[1])/2)
+        
+        pl1 = self.lane.left_boundary[idx+1]
+        pr1 = self.lane.right_boundary[idx+1]
+        p1 = ((pl1[0]+pr1[0])/2, (pl1[1]+pr1[1])/2)
+        
+        residue = draw_s - idx
+        cx = p0[0] + (p1[0] - p0[0]) * residue
+        cy = p0[1] + (p1[1] - p0[1]) * residue
+        
+        # Heading of road
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        h = math.atan2(dy, dx)
+        
+        # Add Offset perpendicular to road
+        # Perpendicular: (-dy, dx)
+        norm = math.sqrt(dx*dx + dy*dy)
+        if norm > 0:
+            ox = -dy / norm
+            oy = dx / norm
+        else:
+            ox, oy = 0, 0
+            
+        current_offset = self.offset
+        
+        self.x = cx + ox * current_offset
+        self.y = cy + oy * current_offset
+
+    def update(self, dt):
+        self.mode_timer -= dt
+        
+        speed = 1.0 # Walking speed m/s
+        
+        if self.mode == "SIDEWALK":
+            # Walk along S
+            self.s += speed * dt * self.direction
+            
+            # Boundary check
+            max_s = len(self.lane.left_boundary) - 1.0
+            if self.s > max_s or self.s < 0:
+                self.direction *= -1
+                self.s = max(0, min(self.s, max_s))
+            
+            # Switch to CROSSING?
+            if self.mode_timer <= 0:
+                if random.random() < 0.3: # 30% chance to Jaywalk when timer expires
+                    self.mode = "CROSSING"
+                    # Target: Cross the full road.
+                    # Lane width ~3.5 -> 4.0m. 2 Lanes = ~7-8m.
+                    # Start at 3.5m (Sidewalk).
+                    # Target: -8.0m (Other Sidewalk approx).
+                    self.crossing_target = -8.0 if self.offset > 0 else 8.0 
+                    self.crossing_speed = 2.0 # Run faster
+                self.mode_timer = random.uniform(5.0, 15.0)
+                
+        elif self.mode == "CROSSING":
+            # Move Offset
+            dist = self.crossing_target - self.offset
+            step = self.crossing_speed * dt
+            
+            if abs(dist) < step:
+                self.offset = self.crossing_target
+                self.mode = "SIDEWALK" # Done crossing
+                # Snap to reasonable sidewalk offset just in case 8.0 is too far
+                self.offset = 3.5 if self.offset > 0 else -3.5
+            else:
+                self.offset += step * (1 if dist > 0 else -1)
+                
+        self._update_pos()
 
 
 class TrafficManager:
@@ -173,7 +269,17 @@ class TrafficManager:
         self.vehicles = []
         self.lanes_map = {} # (road_id, lane_id) -> Lane
         self._build_lane_map()
+        self.pedestrians = [] # List of Pedestrians
+
+    def spawn_pedestrians(self, n=20):
+        driving_lanes = [l for l in self.parser.lanes if l.type == 'driving']
+        if not driving_lanes: return
         
+        for i in range(n):
+            lane = random.choice(driving_lanes)
+            p = Pedestrian(i, lane)
+            self.pedestrians.append(p)
+
     def _build_lane_map(self):
         for lane in self.parser.lanes:
             if hasattr(lane, 'road_id'):
@@ -209,14 +315,46 @@ class TrafficManager:
              self.lights_map[(l.road_id, l.lane_id)] = l
 
     def update(self, dt):
+        # Update Pedestrians
+        for p in self.pedestrians:
+            p.update(dt)
+
         for v in self.vehicles:
             # Skip Lane Change Logic for Ego (Free Roam)
             if isinstance(v, EgoVehicle):
                 pass
             
-            # Find lead vehicle
+            # Find lead vehicle/Object
             min_dist = 1000.0
             lead_v_speed = 0
+            
+            # Check Pedestrians
+            vx, vy, vh = v.get_position()
+            # Vector V direction
+            v_dir_x = math.cos(vh)
+            v_dir_y = math.sin(vh)
+            
+            for p in self.pedestrians:
+                if p.mode == "CROSSING":
+                    # Check distance
+                    dx = p.x - vx
+                    dy = p.y - vy
+                    dist_sq = dx*dx + dy*dy
+                    
+                    if dist_sq < 20*20: # Within 20m
+                        dist = math.sqrt(dist_sq)
+                        
+                        # Check Angle (In front?)
+                        # Dot Product
+                        dot = (dx/dist)*v_dir_x + (dy/dist)*v_dir_y
+                        if dot > 0.7: # Approx 45 degrees cone
+                             # It's an obstacle!
+                             # Map to IDM gap terms
+                             # "dist" is center-to-center roughly.
+                             gap = dist - (v.length/2 + 1.0) # 1.0 buffer for person
+                             if gap < min_dist:
+                                 min_dist = gap
+                                 lead_v_speed = 0 # Pedestrian is stopping/slow obstacle
             
             # Simple linear search (optimize later with spatial hash if needed)
             for other in self.vehicles:
