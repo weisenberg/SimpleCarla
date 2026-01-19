@@ -101,6 +101,72 @@ class Vehicle:
         # Move
         self.s += self.speed * dt * self.direction
 
+class EgoVehicle(Vehicle):
+    def __init__(self, v_id, lane, s, speed, config):
+        super().__init__(v_id, lane, s, speed, config)
+        self.color = (0, 255, 0) # Green
+        self.throttle = 0.0 
+        self.steering = 0.0 # -1.0 (Left) to 1.0 (Right)
+        
+        # Free Roam State
+        # Calculate initial x, y, h from lane/s
+        self.x, self.y, self.h = super().get_position()
+        self.free_roam_active = True
+
+    def apply_control(self, throttle, steering):
+        self.throttle = throttle
+        self.steering = steering
+
+    def get_position(self):
+        # Override to return free roam state
+        return self.x, self.y, self.h
+
+    def update(self, dt, lead_vehicle_gap):
+        # 1. Physics (Kinematic Bicycle Model)
+        
+        # Acceleration
+        acc = self.throttle * 8.0 
+        # Braking / Reverse Logic
+        if (self.throttle > 0 and self.speed < 0) or (self.throttle < 0 and self.speed > 0):
+             acc *= 2.0 
+        
+        self.speed += acc * dt
+        
+        # Cap Speed
+        if self.speed > 40.0: self.speed = 40.0
+        if self.speed < -15.0: self.speed = -15.0 
+        
+        # Steering (Yaw Rate)
+        # Max steering angle roughly 45 deg? 
+        # yaw_rate = (speed / wheelbase) * tan(steer_angle)
+        # Let's simplify: Turn Rate proportional to steering & speed
+        # But allow turning when slow too? No, cars need speed to turn.
+        
+        wheelbase = 3.0 # Approx
+        max_steer_angle = math.radians(40)
+        steer_angle = self.steering * max_steer_angle
+        
+        # Small speed threshold to avoid jitter at 0
+        if abs(self.speed) > 0.1:
+            # Kinematic Bicycle
+            # beta = atan( l_r / l * tan(delta) ) ? Assuming Center of Mass.
+            # Simplified: dH/dt = (v / L) * tan(delta)
+            
+            yaw_rate = (self.speed / wheelbase) * math.tan(steer_angle)
+            self.h += yaw_rate * dt
+        
+        # Update Position
+        self.x += self.speed * math.cos(self.h) * dt
+        self.y += self.speed * math.sin(self.h) * dt
+        
+        # Note: We ignore 'lane' and 's' updates for Ego.
+        # This means interactions with TrafficManager (lead vehicle) might break
+        # if TrafficManager relies on 'lane' to find neighbors.
+        # For now, we accept Ego is "Ghost" or we need to map-match.
+        # Given "Free Roam", we likely accept Ghost for now.
+        
+
+
 class TrafficManager:
     def __init__(self, parser):
         self.parser = parser
@@ -144,6 +210,10 @@ class TrafficManager:
 
     def update(self, dt):
         for v in self.vehicles:
+            # Skip Lane Change Logic for Ego (Free Roam)
+            if isinstance(v, EgoVehicle):
+                pass
+            
             # Find lead vehicle
             min_dist = 1000.0
             lead_v_speed = 0
@@ -217,6 +287,15 @@ class TrafficManager:
                      new_s = -1
             
             if should_switch and next_road:
+                # Calculate residue (distance traveled past the end of the lane)
+                # Max S for current lane
+                max_s_prev = len(v.lane.left_boundary) - 1.0
+                residue = 0.0
+                if v.direction == 1:
+                    residue = max(0.0, v.s - max_s_prev)
+                else:
+                    residue = max(0.0, 0.0 - v.s)
+                
                 # Unpack with contact point support
                 contact = 'start'
                 if len(next_road) == 3:
@@ -237,15 +316,18 @@ class TrafficManager:
                         # Update direction
                         v.direction = 1 if v.lane.id < 0 else -1
                         
-                        # Set S based on Contact Point
+                        # New Max S
+                        max_s_new = len(next_lane.left_boundary) - 1.0
+                        
+                        # Set S based on Contact Point + Residue
                         if contact == 'start':
-                             v.s = 0.5
+                             v.s = residue
                         elif contact == 'end':
-                             v.s = len(next_lane.left_boundary) - 1.5
+                             v.s = max_s_new - residue
                         else:
                              # Fallback
-                             v.s = 0.5 if v.direction == 1 else len(next_lane.left_boundary) - 1.5
-                            
+                             v.s = residue if v.direction == 1 else max_s_new - residue
+
                     else:
                         v.speed = 0 # Dead end
                         print(f"Vehicle {v.id} stopped: Dead End at Road {v.lane.road_id} Lane {v.lane.id}. Next Key {key} not found.")

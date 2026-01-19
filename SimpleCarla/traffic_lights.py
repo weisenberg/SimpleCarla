@@ -23,9 +23,9 @@ class IntersectionController:
         self.phase = "GREEN" # GREEN -> YELLOW -> RED (switch)
         
         # Config
-        self.green_duration = 5.0
+        self.green_duration = 3.0 # Reduced from 5.0 for faster cycling
         self.yellow_duration = 2.0
-        self.all_red_duration = 2.0
+        self.all_red_duration = 1.0 # Reduced from 2.0
         
         # Initial State
         self._apply_state()
@@ -150,6 +150,9 @@ class IntersectionController:
         # Set current group to Phase IF phase is GREEN or YELLOW
         if self.phase in ["GREEN", "YELLOW"] and self.groups:
             current_g = self.groups[self.current_group_idx]
+            for l in current_g:
+                l.state = self.phase
+        
             for l in current_g:
                 l.state = self.phase
                 
