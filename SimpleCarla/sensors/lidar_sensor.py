@@ -11,6 +11,7 @@ class LidarSensor(SensorBase):
         self.pps = points_per_second
         self.fov = fov
         self.detected_points = []
+        self.min_dist = self.max_range
 
     def tick(self, dt):
         parent = self._get_parent()
@@ -55,7 +56,14 @@ class LidarSensor(SensorBase):
             # To be useful, let's cast against "world bounds" or "dummy".
             pass
         
+            if t < self.min_dist:
+                 self.min_dist = t
+            # ... existing logic ...
+            pass
+            
         self.detected_points = np.array(points)
+        # Store for external access 
+        # (This is dummy logic updates since actual env uses _compute_lidar)
         
         if self.callback:
             self.callback(self.detected_points)

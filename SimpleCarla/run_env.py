@@ -12,6 +12,7 @@ def main():
     parser.add_argument('--lidar', action='store_true', help='Enable Lidar Sensor')
     parser.add_argument('--collision', action='store_true', help='Enable Collision Detector')
     parser.add_argument('--lane', action='store_true', help='Enable Lane Sensor (Lateral Error)')
+    parser.add_argument('--endless', action='store_true', help='Run in infinite episode mode (ignore collision termination)')
     args = parser.parse_args()
     
     enable_traffic = args.traffic is not None
@@ -26,7 +27,7 @@ def main():
 
     print("Running visualization. Press Ctrl+C to exit.")
 
-    env = SimpleCarlaEnv(map_name=args.map, render_mode="human", enable_traffic=enable_traffic, traffic_density=traffic_density, enable_pedestrians=enable_pedestrians, pedestrian_density=pedestrian_density, enable_ego=enable_ego, sensors=sensors)
+    env = SimpleCarlaEnv(map_name=args.map, render_mode="human", enable_traffic=enable_traffic, traffic_density=traffic_density, enable_pedestrians=enable_pedestrians, pedestrian_density=pedestrian_density, enable_ego=enable_ego, sensors=sensors, infinite_episode=args.endless)
     
     if enable_traffic:
         print("Traffic enabled:", traffic_density)
@@ -55,27 +56,24 @@ def main():
             
             # Continuous Input
             keys = pygame.key.get_pressed()
-            if keys[pygame.K_w]: throttle = 1.0
-            if keys[pygame.K_s]: throttle = -1.0
             
-            # Steering (Left is +Angle in standard math, but check Coordinate System)
-            # Pygame Y is flipped.
-            # EgoVehicle heading: Math Angle (CCW from East).
-            # To turn Left (North): Increase Angle (+).
-            # To turn Right (South): Decrease Angle (-).
-            # Key A (Left) -> Positive Steer?
-            # Key D (Right) -> Negative Steer?
+            # Map to MultiDiscrete([3, 3])
+            # Throttle: 0=Brake/Rev, 1=Idle, 2=Accel
+            throttle_idx = 1 # Idle
+            if keys[pygame.K_w]: throttle_idx = 2
+            elif keys[pygame.K_s]: throttle_idx = 0
             
-            # Let's try:
-            # A -> +1.0
-            # D -> -1.0
-            
-            steering = 0.0
-            if keys[pygame.K_a]: steering = 1.0 
-            if keys[pygame.K_d]: steering = -1.0
+            # Steer: 0=Left, 1=Center, 2=Right
+            # Note: 0 maps to -1.0 (Right Turn in our coord system?), 2 maps to +1.0 (Left Turn in our coord system?)
+            # Logic: Positive Yaw is Left (CCW).
+            # So we want A (Left) -> Positive Steering (+1.0) -> Index 2
+            # We want D (Right) -> Negative Steering (-1.0) -> Index 0
+            steer_idx = 1 # Center
+            if keys[pygame.K_a]: steer_idx = 2 
+            elif keys[pygame.K_d]: steer_idx = 0
             
             # Step with Action
-            action = (throttle, steering)
+            action = [throttle_idx, steer_idx] # Pass as list/array for MultiDiscrete
             obs, reward, terminated, truncated, info = env.step(action) 
             
             if terminated or truncated:

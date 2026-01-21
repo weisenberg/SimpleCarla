@@ -13,7 +13,7 @@ from rewards import RewardSignal
 class SimpleCarlaEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
-    def __init__(self, map_name="Town01", render_mode=None, enable_traffic=False, traffic_density="high", enable_ego=False, enable_pedestrians=False, pedestrian_density="mid", sensors=None):
+    def __init__(self, map_name="Town01", render_mode=None, enable_traffic=False, traffic_density="high", enable_ego=False, enable_pedestrians=False, pedestrian_density="mid", sensors=None, infinite_episode=False):
         self.map_name = map_name
         self.render_mode = render_mode
         self.enable_traffic = enable_traffic
@@ -21,6 +21,9 @@ class SimpleCarlaEnv(gym.Env):
         self.enable_ego = enable_ego
         self.enable_pedestrians = enable_pedestrians
         self.pedestrian_density = pedestrian_density
+        self.enable_pedestrians = enable_pedestrians
+        self.pedestrian_density = pedestrian_density
+        self.infinite_episode = infinite_episode
         
         # Sensor Config
         self.sensors_config = sensors or {'lidar': True, 'collision': True, 'lane': True} # Default all on if not passed? Or off?
@@ -119,8 +122,9 @@ class SimpleCarlaEnv(gym.Env):
         self.pixels_per_meter = min(scale_x, scale_y)
 
         # RL Config
-        self.lidar_rays = 36
+        self.lidar_rays = 32
         self.lidar_range = 50.0
+        self.lidar_fov = math.pi  # 180° forward cone (±90° from heading)
 
         # Visualization State
         self.latest_reward = 0.0
@@ -128,27 +132,60 @@ class SimpleCarlaEnv(gym.Env):
         self.latest_info = {}
         self.latest_lidar = np.zeros((self.lidar_rays,), dtype=np.float32)
 
+        # Observation Config
+        self.obs_size = 84 # Standard RL Input Size
+        
         # Placeholder Action/Obs (Modified observation space from snippet)
-        self.action_space = spaces.Discrete(5)
+        # MultiDiscrete([3, 3]) -> [Throttle (0,1,2), Steer (0,1,2)]
+        self.action_space = spaces.MultiDiscrete([3, 3])
         self.observation_space = spaces.Dict({
-            'minimap': spaces.Box(low=0, high=255, shape=(self.screen_height, self.screen_width, 3), dtype=np.uint8),
+            'minimap': spaces.Box(low=0, high=255, shape=(self.obs_size, self.obs_size, 3), dtype=np.uint8),
             'lidar': spaces.Box(low=0.0, high=self.lidar_range, shape=(self.lidar_rays,), dtype=np.float32),
             'speed': spaces.Box(low=0, high=100, shape=(1,), dtype=np.float32),
             'steering': spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32),
             'lateral_error': spaces.Box(low=-100, high=100, shape=(1,), dtype=np.float32),
-            'heading_error': spaces.Box(low=-3.14, high=3.14, shape=(1,), dtype=np.float32)
+            'heading_error': spaces.Box(low=-3.14, high=3.14, shape=(1,), dtype=np.float32),
+            # NEW SENSORS
+            'dist_to_left_boundary': spaces.Box(low=0, high=10.0, shape=(1,), dtype=np.float32),
+            'dist_to_right_boundary': spaces.Box(low=0, high=10.0, shape=(1,), dtype=np.float32),
+            'distance_to_lead': spaces.Box(low=0, high=100.0, shape=(1,), dtype=np.float32),
+            'traffic_light_state': spaces.Box(low=0, high=1.0, shape=(1,), dtype=np.float32),  # 0=Green/None, 1=Red
         })
 
     def _spawn_ego(self):
         # Spawn EGO
         driving_lanes = [l for l in self.parser.lanes if l.type == 'driving']
         if driving_lanes:
-            lane = random.choice(driving_lanes)
-            length = len(lane.left_boundary)
-            s = random.uniform(0, length - 5)
-            # Create Ego
-            config = {'color': (0, 255, 0), 'target_speed': 20.0, 'length': 4.5}
-            self.ego_vehicle = EgoVehicle(9999, lane, s, 0, config)
+            safe_margin = 10.0 # meters buffer
+            
+            for attempt in range(30):
+                lane = random.choice(driving_lanes)
+                length = len(lane.left_boundary)
+                s = random.uniform(0, length - 5)
+                
+                # Create Candidate Config
+                config = {'color': (0, 255, 0), 'target_speed': 20.0, 'length': 4.5}
+                # Create temp object to get position (Instantiating is cheap enough)
+                candidate = EgoVehicle(9999, lane, s, 0, config)
+                cx, cy, _ = candidate.get_position()
+                
+                collision = False
+                if self.traffic_manager:
+                    for v in self.traffic_manager.vehicles:
+                        vx, vy, _ = v.get_position()
+                        dist = math.sqrt((cx-vx)**2 + (cy-vy)**2)
+                        if dist < safe_margin:
+                            collision = True
+                            break
+                
+                if not collision:
+                    self.ego_vehicle = candidate
+                    self.traffic_manager.vehicles.append(self.ego_vehicle)
+                    return
+            
+            # Fallback
+            print("Warning: Could not find clear spawn for Ego. Spawning anyway.")
+            self.ego_vehicle = candidate
             self.traffic_manager.vehicles.append(self.ego_vehicle)
         else:
             self.ego_vehicle = None
@@ -157,6 +194,22 @@ class SimpleCarlaEnv(gym.Env):
         super().reset(seed=seed)
         self.reward_signal.reset()
         self.total_reward = 0.0
+        
+        # Handle Dynamic Config via Options
+        if options:
+            if 'traffic' in options:
+                self.traffic_density = options['traffic']
+                self.enable_traffic = (self.traffic_density != 'no') # 'no' or None disables? assume 'no' means 0 cars but enabled flag?
+                # User said "various modes of traffic... like no to high"
+                # If traffic is 'no' or None, maybe we set enable_traffic=False?
+                if self.traffic_density in [None, 'no', 'none']:
+                    self.enable_traffic = False
+                else:
+                    self.enable_traffic = True
+                    
+            if 'pedestrians' in options:
+                self.pedestrian_density = options['pedestrians']
+                self.enable_pedestrians = (self.pedestrian_density not in [None, 'no', 'none'])
         
         # Reset traffic if enabled (from snippet)
         if self.traffic_manager:
@@ -178,7 +231,9 @@ class SimpleCarlaEnv(gym.Env):
 
             if self.enable_ego:
                 self._spawn_ego()
-                
+        
+        self.current_episode_time = 0.0
+        
         # Return observation matching new observation space
         return self._get_obs(), {}
 
@@ -186,10 +241,20 @@ class SimpleCarlaEnv(gym.Env):
         dt = 1.0/self.metadata["render_fps"]
         
         # Apply Action to Ego (if discrete/dict passed from run_env)
-        # Assuming action is a dict or tuple: (throttle, steering)
-        if self.enable_ego and self.ego_vehicle and isinstance(action, tuple):
-             throttle, steering = action
-             self.ego_vehicle.apply_control(throttle, steering)
+        # Apply Action to Ego (if discrete/dict passed from run_env)
+        # MultiDiscrete([3, 3])
+        # Action is array-like: [throttle_idx, steer_idx]
+        if self.enable_ego and self.ego_vehicle:
+            throttle_idx = action[0]
+            steer_idx = action[1]
+            
+            # Throttle Mapping: 0->-1.0 (Rev), 1->0.0 (Idle), 2->1.0 (Fwd)
+            throttle = float(throttle_idx - 1)
+            
+            # Steering Mapping: 0->-1.0 (Left), 1->0.0 (Center), 2->1.0 (Right)
+            steering = float(steer_idx - 1)
+            
+            self.ego_vehicle.apply_control(throttle, steering)
 
         # Update Traffic (Added from snippet)
         if self.traffic_manager:
@@ -213,7 +278,7 @@ class SimpleCarlaEnv(gym.Env):
                 if 'lateral_error' in obs:
                      lat_err = float(obs['lateral_error'][0])
                      head_err = float(obs['heading_error'][0])
-                lane_type, _, _ = self._get_lane_metrics()
+                lane_type, _, _, _, _ = self._get_lane_metrics()
 
         # Collision Check (Flag Check)
         is_collision = False 
@@ -280,6 +345,15 @@ class SimpleCarlaEnv(gym.Env):
         is_off_road = (lane_type == 'none')
         is_red_light = self._check_red_light()
         
+        self.current_episode_time += dt
+        
+        # Min Lidar
+        min_lidar_dist = 50.0
+        if 'lidar' in obs:
+            lidar_data = obs['lidar']
+            if len(lidar_data) > 0:
+                 min_lidar_dist = float(np.min(lidar_data))
+        
         info = {
             'speed': self.ego_vehicle.speed if self.ego_vehicle else 0.0,
             'is_collision': is_collision,
@@ -288,11 +362,17 @@ class SimpleCarlaEnv(gym.Env):
             'is_red_light': is_red_light,
             'distance_to_lead': dist_lead,
             'lateral_error': lat_err,
-            'heading_error': head_err
+            'heading_error': head_err,
+            'min_lidar_dist': min_lidar_dist,
+            'current_time': self.current_episode_time
         }
         
         # Reward
         reward, terminated, truncated = self.reward_signal.compute(info, dt)
+        
+        if self.infinite_episode:
+             terminated = False
+             truncated = False
         
         # Store for Visualization
         self.latest_reward = reward
@@ -321,7 +401,7 @@ class SimpleCarlaEnv(gym.Env):
         return inside
 
     def _get_lane_metrics(self):
-        if not self.ego_vehicle: return 'none', 0.0, 0.0
+        if not self.ego_vehicle: return 'none', 0.0, 0.0, 10.0, 10.0
         
         x, y, h = self.ego_vehicle.get_position()
         
@@ -338,7 +418,7 @@ class SimpleCarlaEnv(gym.Env):
                 break
         
         if not best_lane:
-             return 'none', 10.0, 0.0 # Off road
+             return 'none', 10.0, 0.0, 10.0, 10.0  # Off road (5 values)
              
         # 2. Compute Metrics relative to Center Line
         # Lane Center Line = Average of Left and Right boundaries.
@@ -409,8 +489,15 @@ class SimpleCarlaEnv(gym.Env):
                 
                 head_err = diff
                 lane_heading = heading_ref
+                
+                # Calculate distances to lane boundaries at this closest point
+                pl = pts_l[i]
+                dist_left = math.sqrt((x - pl[0])**2 + (y - pl[1])**2)
+                
+                pr = pts_r[i]
+                dist_right = math.sqrt((x - pr[0])**2 + (y - pr[1])**2)
 
-        return best_lane.type, lat_err, head_err
+        return best_lane.type, lat_err, head_err, dist_left, dist_right
 
     def _check_red_light(self):
         # Determine if Ego is approaching a RED light
@@ -434,7 +521,7 @@ class SimpleCarlaEnv(gym.Env):
         return False
         
         if not best_lane:
-             return 'none', 10.0, 0.0 # Off road
+             return 'none', 10.0, 0.0, 10.0, 10.0  # Off road (5 values: type, lat, head, left_dist, right_dist)
              
         # 2. Compute Metrics relative to Center Line
         # Lane Center Line = Average of Left and Right boundaries.
@@ -443,6 +530,8 @@ class SimpleCarlaEnv(gym.Env):
         min_dist = 1000.0
         lat_err = 0.0
         lane_heading = 0.0
+        dist_left = 10.0  # Default
+        dist_right = 10.0  # Default
         
         pts_l = best_lane.left_boundary
         pts_r = best_lane.right_boundary
@@ -520,9 +609,21 @@ class SimpleCarlaEnv(gym.Env):
                 
                 head_err = diff
                 lane_heading = heading_ref
+                
+                # Calculate distances to lane boundaries
+                # Find closest point on left and right boundaries
+                # We already have the closest segment index from above (i)
+                # Distance to left boundary
+                pl = pts_l[i]
+                dist_left = math.sqrt((x - pl[0])**2 + (y - pl[1])**2)
+                
+                # Distance to right boundary  
+                pr = pts_r[i]
+                dist_right = math.sqrt((x - pr[0])**2 + (y - pr[1])**2)
 
         # Handle 'shoulder' type as bad? Yes, it's 'shoulder'.
-        return best_lane.type, lat_err, head_err
+        # Return: lane_type, lateral_error, heading_error, dist_to_left_edge, dist_to_right_edge
+        return best_lane.type, lat_err, head_err, dist_left if best_lane else 10.0, dist_right if best_lane else 10.0
 
     def _compute_lidar(self):
         if not self.ego_vehicle or not self.sensors_config.get('lidar', False):
@@ -546,10 +647,11 @@ class SimpleCarlaEnv(gym.Env):
         if not obstacles:
              return ranges
              
-        # Cast Rays
-        # FOV: 360 degrees?
+        # Cast Rays - Forward cone: 180° (±90° from heading)
         for i in range(self.lidar_rays):
-            angle = h + (i / self.lidar_rays) * 2 * math.pi
+            # Map ray index to angle within FOV
+            angle_offset = (i / (self.lidar_rays - 1)) * self.lidar_fov - (self.lidar_fov / 2)
+            angle = h + angle_offset
             rx = math.cos(angle)
             ry = math.sin(angle)
             
@@ -598,9 +700,45 @@ class SimpleCarlaEnv(gym.Env):
         return ranges
 
     def _get_obs(self):
-        img = np.zeros((self.screen_height, self.screen_width, 3), dtype=np.uint8)
-        if self.render_mode == "rgb_array":
-             img = self.render()
+        # Optimized Agent Observation (Fast, Low-Res, No Text)
+        if not hasattr(self, 'agent_surface'):
+             self.agent_surface = pygame.Surface((self.obs_size, self.obs_size))
+        
+        # Determine scale for agent view
+        # We want roughly the same FOV as global map but on 84x84?
+        # Or Ego Centric? Implementation Plan said "CNN for Minimap", implied global/ego?
+        # Current logic used full screen scale.
+        # Let's try to match the View 1 (Global) scale but relative to 84x84.
+        
+        world_w = self.max_x - self.min_x
+        world_h = self.max_y - self.min_y
+        
+        # Scale to fit 84x84 with small margin
+        margin = 2
+        sx = (self.obs_size - 2*margin) / world_w if world_w > 0 else 1.0
+        sy = (self.obs_size - 2*margin) / world_h if world_h > 0 else 1.0
+        ppm_agent = min(sx, sy)
+        
+        def to_agent_screen(x, y):
+             return int((x - self.min_x) * ppm_agent + margin), int(self.obs_size - ((y - self.min_y) * ppm_agent + margin))
+
+        # Clear
+        self.agent_surface.fill((0, 0, 0))
+        
+        # Draw Simplified World (Lanes + Ego + Traffic)
+        self._draw_world(self.agent_surface, to_agent_screen, ppm_agent, simple=True)
+        
+        # Vehicles (Simple Rects)
+        if self.traffic_manager:
+            for v in self.traffic_manager.vehicles:
+                vx, vy, vh = v.get_position()
+                # Vehicle class stores self.color, not self.config['color']
+                c = getattr(v, 'color', (0, 0, 255))
+                px, py = to_agent_screen(vx, vy)
+                pygame.draw.circle(self.agent_surface, c, (px, py), 2)
+
+        # Output
+        img = np.transpose(np.array(pygame.surfarray.pixels3d(self.agent_surface)), axes=(1, 0, 2))
         
         # Lidar Logic
         lidar = self._compute_lidar()
@@ -617,9 +755,29 @@ class SimpleCarlaEnv(gym.Env):
             steer = ego_v.steering
             
             if self.sensors_config.get('lane', False):
-                lt, le, he = self._get_lane_metrics()
+                lt, le, he, dist_left_bound, dist_right_bound = self._get_lane_metrics()
                 lat_err = le
                 head_err = he
+            
+        # Get lead vehicle distance (already computed in step but not in obs!)
+        lead_dist = 100.0
+        if self.ego_vehicle and self.traffic_manager:
+            ex, ey, eh = self.ego_vehicle.get_position()
+            vx, vy = math.cos(eh), math.sin(eh)
+            for v in self.traffic_manager.vehicles:
+                if v is not self.ego_vehicle:
+                    tx, ty, _ = v.get_position()
+                    dx, dy = tx - ex, ty - ey
+                    proj = dx * vx + dy * vy
+                    if proj > 0 and proj < lead_dist:
+                        perp = abs(-vy * dx + vx * dy)
+                        if perp < 2.0:
+                            lead_dist = proj
+        
+        # Get traffic light state
+        traffic_light = 0.0  # 0=Green/None, 1=Red
+        if self._check_red_light():
+            traffic_light = 1.0
             
         return {
             'minimap': img,
@@ -627,20 +785,26 @@ class SimpleCarlaEnv(gym.Env):
             'speed': np.array([spd], dtype=np.float32),
             'steering': np.array([steer], dtype=np.float32),
             'lateral_error': np.array([lat_err], dtype=np.float32),
-            'heading_error': np.array([head_err], dtype=np.float32)
+            'heading_error': np.array([head_err], dtype=np.float32),
+            # NEW SENSORS
+            'dist_to_left_boundary': np.array([dist_left_bound], dtype=np.float32),
+            'dist_to_right_boundary': np.array([dist_right_bound], dtype=np.float32),
+            'distance_to_lead': np.array([lead_dist], dtype=np.float32),
+            'traffic_light_state': np.array([traffic_light], dtype=np.float32),
         }
 
     def render(self):
         if self.window is None and self.render_mode == "human":
             pygame.init()
             pygame.display.init()
-            self.window = pygame.display.set_mode((self.screen_width, self.screen_height)) # Changed to screen_width/height
-            pygame.display.set_caption(f"SimpleCarla - {self.map_name}") # Kept map_name
+            self.window = pygame.display.set_mode((self.screen_width, self.screen_height)) 
+            pygame.display.set_caption(f"SimpleCarla - {self.map_name}") 
         
         if self.clock is None and self.render_mode == "human":
             self.clock = pygame.time.Clock()
 
-        canvas = pygame.Surface((self.screen_width, self.screen_height)) # Changed to screen_width/height
+        canvas = pygame.Surface((self.screen_width, self.screen_height)) 
+        self.screen = canvas # Save just in case, though unused by _get_obs now
         canvas.fill((0, 100, 0)) # Green background
 
         # --- View 1: Global Map (Left) ---
@@ -701,10 +865,42 @@ class SimpleCarlaEnv(gym.Env):
                 
                 return int(sx), int(sy)
             
+            # --- View 1 Vehicle Drawing ---
+            if self.traffic_manager:
+                for v in self.traffic_manager.vehicles:
+                    if v is self.ego_vehicle: continue
+                    vx, vy, vh = v.get_position()
+                    sx, sy = to_screen_global(vx, vy)
+                    pygame.draw.circle(canvas, getattr(v, 'color', (0,0,255)), (sx, sy), 3)
+
+            # --- View 2: Ego View ---
             # Set clip for drawing
             canvas.set_clip(right_rect)
             self._draw_world(canvas, to_screen_ego, ppm_ego, ego_mode=True)
             self._draw_lidar(canvas, to_screen_ego, ego_mode=True) # Draw Lidar in Ego View
+            
+            # Draw Vehicles in View 2
+            if self.traffic_manager:
+                for v in self.traffic_manager.vehicles: 
+                    # Optimization: Check if in view?
+                    vx, vy, vh = v.get_position()
+                    
+                    # Draw Ego (Center)
+                    if v is self.ego_vehicle:
+                        # Draw Rectangle for Ego
+                        # Center is view2_center_x, view2_center_y
+                        # Dimensions scaled
+                        w = v.width * ppm_ego
+                        l = v.length * ppm_ego
+                        rect = pygame.Rect(0, 0, w, l)
+                        rect.center = (view2_center_x, view2_center_y)
+                        pygame.draw.rect(canvas, (0, 255, 0), rect) # Ego is Green
+                    else:
+                        # NPC
+                        px, py = to_screen_ego(vx, vy)
+                        # Rotate heading? Maybe just circle for now
+                        pygame.draw.circle(canvas, getattr(v, 'color', (0,0,255)), (px, py), 4)
+
             canvas.set_clip(None) # Reset clip
             
             # Draw Separator
@@ -743,15 +939,15 @@ class SimpleCarlaEnv(gym.Env):
         if self.render_mode == "human":
             self.window.blit(canvas, (0, 0))
             pygame.event.pump()
-            pygame.display.update() # Added update
+            pygame.display.update() 
             self.clock.tick(self.metadata["render_fps"])
-            return None # Changed return for human mode
-        else:
+            return None 
+        elif self.render_mode == "rgb_array":
             return np.transpose(
                 np.array(pygame.surfarray.pixels3d(canvas)), axes=(1, 0, 2)
             )
 
-    def _draw_world(self, canvas, to_screen_func, ppm, ego_mode=False):
+    def _draw_world(self, canvas, to_screen_func, ppm, ego_mode=False, simple=False):
         # Draw Lanes (Polygons) (Modified from snippet)
         for lane in self.parser.lanes:
             poly = lane.get_polygon()
@@ -761,56 +957,63 @@ class SimpleCarlaEnv(gym.Env):
             screen_poly = [to_screen_func(p[0], p[1]) for p in poly]
             
             color = (128, 128, 128) # Default Asphalt
-            if lane.type == 'shoulder':
-                color = (100, 100, 100) # Darker
-            elif lane.type == 'sidewalk':
-                color = (200, 200, 200) # Light Grey
-            elif lane.type == 'driving':
-                color = (50, 50, 50) # Dark Asphalt
-            elif lane.type == 'none':
-                if lane.is_junction:
-                     color = (60, 60, 60) # Slightly lighter for junction
-                else:
-                     continue
+            if simple:
+                # High contrast for RL
+                 if lane.type == 'driving': color = (255, 255, 255) # White Road
+                 else: continue # Don't draw shoulder/sidewalk for simple agent view? Or Draw as Grey?
+                 # Actually, keeping it simple: Driving = White, Off = Black
+            else:
+                if lane.type == 'shoulder':
+                    color = (100, 100, 100) # Darker
+                elif lane.type == 'sidewalk':
+                    color = (200, 200, 200) # Light Grey
+                elif lane.type == 'driving':
+                    color = (50, 50, 50) # Dark Asphalt
+                elif lane.type == 'none':
+                    if lane.is_junction:
+                         color = (60, 60, 60) # Slightly lighter for junction
+                    else:
+                         continue
             
             pygame.draw.polygon(canvas, color, screen_poly)
             
-        # Draw Lines
-        for line in self.parser.lines:
-            if len(line.points) < 2: continue
-            
-            # Color
-            c = (255, 255, 255) # White
-            if line.color == "yellow":
-                c = (255, 255, 0)
-            elif line.color == "blue":
-                c = (0, 0, 255)
-            elif line.color == "green":
-                c = (0, 255, 0)
-            elif line.color == "red":
-                c = (255, 0, 0)
-            
-            # Handle Junction Guides (Modified from snippet)
-            is_guide = False
-            if line.type == "none" and line.is_junction:
-                is_guide = True
-                c = (180, 180, 180) # Grey
-            
-            should_draw_solid = (line.type == "solid")
-            should_draw_broken = (line.type in ["broken", "dashed", "dotted"]) or is_guide
-            
-            line_width = 2
-            pts = [to_screen_func(p[0], p[1]) for p in line.points]
+        # Draw Lines (Skip for simple mode to save FPS?)
+        if not simple:
+            for line in self.parser.lines:
+                if len(line.points) < 2: continue
+                
+                # Color
+                c = (255, 255, 255) # White
+                if line.color == "yellow":
+                    c = (255, 255, 0)
+                elif line.color == "blue":
+                    c = (0, 0, 255)
+                elif line.color == "green":
+                    c = (0, 255, 0)
+                elif line.color == "red":
+                    c = (255, 0, 0)
+                
+                # Handle Junction Guides (Modified from snippet)
+                is_guide = False
+                if line.type == "none" and line.is_junction:
+                    is_guide = True
+                    c = (180, 180, 180) # Grey
+                
+                should_draw_solid = (line.type == "solid")
+                should_draw_broken = (line.type in ["broken", "dashed", "dotted"]) or is_guide
+                
+                line_width = 2
+                pts = [to_screen_func(p[0], p[1]) for p in line.points]
 
-            if should_draw_solid and not is_guide:
-                pygame.draw.lines(canvas, c, False, pts, line_width)
-            elif should_draw_broken:
-                # Dense points check (from snippet)
-                 for i in range(0, len(pts)-1, 2):
-                    pygame.draw.line(canvas, c, pts[i], pts[i+1], line_width)
-            else:
-                 # Solid default (from snippet)
-                 pygame.draw.lines(canvas, c, False, pts, line_width)
+                if should_draw_solid and not is_guide:
+                    pygame.draw.lines(canvas, c, False, pts, line_width)
+                elif should_draw_broken:
+                    # Dense points check (from snippet)
+                     for i in range(0, len(pts)-1, 2):
+                        pygame.draw.line(canvas, c, pts[i], pts[i+1], line_width)
+                else:
+                     # Solid default (from snippet)
+                     pygame.draw.lines(canvas, c, False, pts, line_width)
                  
                  
         # Draw Traffic Lights
@@ -899,9 +1102,10 @@ class SimpleCarlaEnv(gym.Env):
         for i in range(n):
             dist = ranges[i]
             
-            # Angle
+            # Angle - Forward cone matching _compute_lidar
             # Same logic as _compute_lidar
-            angle = h + (i / n) * 2 * math.pi
+            angle_offset = (i / (n - 1)) * self.lidar_fov - (self.lidar_fov / 2)
+            angle = h + angle_offset
             
             # End Point in World
             ex = x + dist * math.cos(angle)
@@ -938,6 +1142,9 @@ class SimpleCarlaEnv(gym.Env):
         # Lines to display
         # Use defaults if info missing
         lines = [
+            f"Map: {self.map_name}",
+            f"Traffic: {self.traffic_density if self.enable_traffic else 'Off'}",
+            f"Peds: {self.pedestrian_density if self.enable_pedestrians else 'Off'}",
             f"Speed: {info.get('speed', 0):.1f} m/s" if info else "Speed: N/A",
             f"Crash: {info.get('is_collision', False)}" if info else "Crash: N/A",
             f"Reward: {self.total_reward:.2f}", # Show Cumulative

@@ -356,9 +356,34 @@ class TrafficManager:
                                  min_dist = gap
                                  lead_v_speed = 0 # Pedestrian is stopping/slow obstacle
             
-            # Simple linear search (optimize later with spatial hash if needed)
+            
+            # Check Ego Vehicle (Free-Roam, not lane-based)
+            # NPCs must avoid the Ego just like they avoid pedestrians
             for other in self.vehicles:
                 if other.id == v.id: continue
+                
+                # Check if OTHER is Ego (Free Roam)
+                if isinstance(other, EgoVehicle):
+                    # Ego doesn't follow lane, so use spatial cone check
+                    ox, oy, _ = other.get_position()
+                    dx = ox - vx
+                    dy = oy - vy
+                    dist_sq = dx*dx + dy*dy
+                    
+                    if dist_sq < 20*20:  # Within 20m
+                        dist = math.sqrt(dist_sq)
+                        
+                        # Check if in front (dot product)
+                        dot = (dx/dist)*v_dir_x + (dy/dist)*v_dir_y
+                        if dot > 0.7:  # ~45 degree cone
+                            # Calculate gap (bumper-to-bumper)
+                            gap = dist - (v.length/2 + other.length/2)
+                            if gap < min_dist:
+                                min_dist = gap
+                                lead_v_speed = other.speed
+                    continue  # Skip lane check for Ego
+                
+                # Same lane check for regular NPCs
                 if other.lane == v.lane:
                     # Same lane check
                     # Calculate signed distance
