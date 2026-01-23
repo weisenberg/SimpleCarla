@@ -220,10 +220,22 @@ class Pedestrian:
         self.x = cx + ox * current_offset
         self.y = cy + oy * current_offset
 
-    def update(self, dt):
+    def update(self, dt, vehicles=[]):
         self.mode_timer -= dt
         
         speed = 1.0 # Walking speed m/s
+        
+        # Check for nearby vehicles (Avoid walking into them)
+        nearby_vehicle = False
+        for v in vehicles:
+            vx, vy, _ = v.get_position()
+            dist_sq = (vx - self.x)**2 + (vy - self.y)**2
+            if dist_sq < 4.0**2: # 4m safety buffer
+                nearby_vehicle = True
+                break
+        
+        if nearby_vehicle and self.mode == "CROSSING":
+             speed = 0.0 # Wait for car to pass
         
         if self.mode == "SIDEWALK":
             # Walk along S
@@ -248,6 +260,8 @@ class Pedestrian:
                 self.mode_timer = random.uniform(5.0, 15.0)
                 
         elif self.mode == "CROSSING":
+            if nearby_vehicle: return # Stop moving
+            
             # Move Offset
             dist = self.crossing_target - self.offset
             step = self.crossing_speed * dt
@@ -317,7 +331,7 @@ class TrafficManager:
     def update(self, dt):
         # Update Pedestrians
         for p in self.pedestrians:
-            p.update(dt)
+            p.update(dt, self.vehicles)
 
         for v in self.vehicles:
             # Skip Lane Change Logic for Ego (Free Roam)
@@ -375,12 +389,26 @@ class TrafficManager:
                         
                         # Check if in front (dot product)
                         dot = (dx/dist)*v_dir_x + (dy/dist)*v_dir_y
+                        
                         if dot > 0.7:  # ~45 degree cone
-                            # Calculate gap (bumper-to-bumper)
-                            gap = dist - (v.length/2 + other.length/2)
-                            if gap < min_dist:
-                                min_dist = gap
-                                lead_v_speed = other.speed
+                            # LATERAL CHECK (New Fix)
+                            # Project dx,dy onto Right Vector (-v_dir_y, v_dir_x)
+                            # Right vector is (cos(h-90), sin(h-90)) = (sin(h), -cos(h)) -> (v_dir_y, -v_dir_x) ??
+                            # Actually: Forward=(cx, cy). Right=(cy, -cx)
+                            
+                            vx_right = v_dir_y
+                            vy_right = -v_dir_x
+                            
+                            lat_dist = abs(dx * vx_right + dy * vy_right)
+                            
+                            # Lane width is ~3.5m. If lat_dist > 2.0, likely safe to pass
+                            if lat_dist < 2.5: 
+                                # Calculate gap (bumper-to-bumper)
+                                gap = dist - (v.length/2 + other.length/2)
+                                if gap < min_dist:
+                                    min_dist = gap
+                                    lead_v_speed = other.speed
+                                    
                     continue  # Skip lane check for Ego
                 
                 # Same lane check for regular NPCs

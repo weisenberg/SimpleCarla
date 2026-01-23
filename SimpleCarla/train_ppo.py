@@ -13,11 +13,36 @@ if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback, StopTrainingOnRewardThreshold
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecVideoRecorder
+from stable_baselines3.common.vec_env import DummyVecEnv, VecVideoRecorder, SubprocVecEnv, VecEnvWrapper
 from simple_carla_env import SimpleCarlaEnv
-# from shimmy.openai_gym_compatibility_wrapper import GymV26CompatibilityV21
+
+class SingleCoreRenderWrapper(VecEnvWrapper):
+    """
+    Wrapper that forces render() to only return the image from the first environment (Rank 0),
+    bypassing the default tiling of all environments.
+    """
+    def __init__(self, venv):
+        super().__init__(venv)
+    
+    def reset(self):
+        return self.venv.reset()
+
+    def step_wait(self):
+        return self.venv.step_wait()
+
+    def render(self, mode='human'):
+        # Only ask Core 0 to render
+        # We assume self.venv is a SubprocVecEnv which has 'remotes'
+        if hasattr(self.venv, 'remotes'):
+             self.venv.remotes[0].send(('render', mode))
+             img = self.venv.remotes[0].recv()
+             return img
+        else:
+             # Fallback for DummyVecEnv or others
+             imgs = self.venv.get_images()
+             return imgs[0] if len(imgs) > 0 else None
 
 class DomainRandomizationCallback(BaseCallback):
     """
@@ -221,8 +246,12 @@ def make_env():
     # Helper to create env (Gym <-> Gymnasium compat handled by Shimmy if installed, else we assume Gym API)
     # SimpleCarlaEnv is gymnasium.Env
     sensors = {'lidar': True, 'collision': True, 'lane': True}
-    # FORCE Traffic On to fix "No Traffic" issue
-    env = SimpleCarlaEnv(render_mode="rgb_array", enable_ego=True, sensors=sensors, enable_traffic=True, traffic_density='mid', pedestrian_density='low', enable_pedestrians=True) 
+    # Default to 'mid' traffic, but DomainRandomizationCallback will override this on rollout start
+    # RENDER_MODE='rgb_array' allows VecVideoRecorder to work. 
+    # Since render() is only called when recording, it won't slow down normal steps significantly.
+    env = SimpleCarlaEnv(render_mode="rgb_array", enable_ego=True, sensors=sensors, 
+                        enable_traffic=True, traffic_density='mid', 
+                        pedestrian_density='low', enable_pedestrians=True) 
     
     # Apply Wrapper
     from wrappers import CarlaObservationWrapper
@@ -245,8 +274,9 @@ def make_env_thunk(rank, seed=0):
 
 def main():
     parser = argparse.ArgumentParser()
-    # Default to 10M steps (effectively infinite for this scale)
-    parser.add_argument("--steps", type=int, default=10_000_000)
+    # Default to 1M steps for standard training
+    parser.add_argument("--steps", type=int, default=1000000, 
+                       help="Total training timesteps")
     args = parser.parse_args()
 
     # Logging Setup
@@ -260,18 +290,24 @@ def main():
     print(f"Logging to: {log_dir}")
     
     # Environment Setup: Parallel Training
-    # Use SubprocVecEnv for 4 parallel processes (Speed boost)
-    num_cpu = 4  
+    # Use SubprocVecEnv for 8 parallel processes (Speed boost)
+    num_cpu = 8  
     # Create the vectorized environment
     env = SubprocVecEnv([make_env_thunk(i) for i in range(num_cpu)])
     
+    # WRAPPER TO FIX VIDEO GRID
+    # Ensures get_images/render only returns Core 0 (Single Video, No Grid)
+    env = SingleCoreRenderWrapper(env)
+    
     # Video Recorder Wrapper
-    # Record every 50 episodes. Since we have N envs, we need to adjust trigger or wrap just one.
-    # VecVideoRecorder works on VecEnvs.
+    # Record approximately every 100 global episodes.
+    # 8 Environments. 1 Episode ~ 500 steps. 
+    # To save every ~100 episodes total: 100 / 8 = 12 episodes per env.
+    # 12 * 500 = 6000 steps.
     video_folder = os.path.join(log_dir, "videos")
     env = VecVideoRecorder(env, video_folder,
-                           record_video_trigger=lambda x: x % (500) == 0, # Record much more effectively (every ~2 episodes per env)
-                           video_length=1000, # Capture full potential episode
+                           record_video_trigger=lambda x: x % 6000 == 0, 
+                           video_length=700, # Capture exactly one episode (30s * 20fps = 600)
                            name_prefix=f"agent-ppo")
 
     # Callbacks

@@ -32,15 +32,15 @@ class CarlaObservationWrapper(gym.ObservationWrapper):
         
         # Define New Spaces
         self.observation_space = spaces.Dict({
-            'camera': spaces.Box(low=0.0, high=1.0, shape=(84, 84, 3), dtype=np.float32),
+            # 'camera' REMOVED for speed
             'lidar': spaces.Box(low=0.0, high=1.0, shape=(32,), dtype=np.float32),
-            'state': spaces.Box(low=-1.0, high=1.0, shape=(10,), dtype=np.float32)
+            'state': spaces.Box(low=-1.0, high=1.0, shape=(12,), dtype=np.float32)
         })
         
     def observation(self, obs):
-        # 1. Camera (Minimap)
-        minimap = obs.get('minimap', np.zeros((84,84,3), dtype=np.uint8))
-        camera_norm = minimap.astype(np.float32) / 255.0
+        # 1. Camera (Minimap) - REMOVED
+        # minimap = obs.get('minimap', np.zeros((84,84,3), dtype=np.uint8))
+        # camera_norm = minimap.astype(np.float32) / 255.0
         
         # 2. Lidar
         lidar_raw = obs.get('lidar', np.zeros((32,), dtype=np.float32))
@@ -62,26 +62,33 @@ class CarlaObservationWrapper(gym.ObservationWrapper):
         dist_left = float(obs.get('dist_to_left_boundary', [10.0])[0])
         dist_left_norm = np.clip(dist_left / 3.5, 0.0, 1.0)
         
-        dist_right = float(obs.get('dist_to_right_boundary', [10.0])[0])
-        dist_right_norm = np.clip(dist_right / 3.5, 0.0, 1.0)
-        
-        lead_dist = float(obs.get('distance_to_lead', [100.0])[0])
-        lead_dist_norm = lead_dist / 50.0
-        
-        traffic_light = float(obs.get('traffic_light_state', [0.0])[0])  # Already 0 or 1
-        
-        # Reserved slots
-        reserved1 = 0.0
-        reserved2 = 0.0
-        
-        state_vec = np.array([
-            vel_norm, steer, lat_norm, head_norm,
-            dist_left_norm, dist_right_norm, lead_dist_norm, traffic_light,
-            reserved1, reserved2
+        dist_left = float(obs.get('dist_to_left_boundary', [0.0])[0])
+        dist_right = float(obs.get('dist_to_right_boundary', [0.0])[0])
+        dist_lead = float(obs.get('distance_to_lead', [50.0])[0])
+        light_state = float(obs.get('traffic_light_state', [0.0])[0])
+
+        # New: Navigation (Target Point 2D)
+        tgt = obs.get('target_point', [0.0, 0.0])
+        tgt_x = float(tgt[0]) / 30.0 # Normalize approx
+        tgt_y = float(tgt[1]) / 30.0 
+
+        # State Vector (12 dimensions)
+        state = np.array([
+            vel_norm,      # 0
+            steer,         # 1
+            lat_norm,      # 2
+            head_norm,     # 3
+            dist_left/10.0, # 4
+            dist_right/10.0,# 5
+            dist_lead/50.0, # 6
+            light_state,    # 7
+            tgt_x,          # 8
+            tgt_y,          # 9
+            0.0,            # 10 (Reserved)
+            0.0             # 11 (Reserved)
         ], dtype=np.float32)
         
         return {
-            'camera': camera_norm,
             'lidar': lidar_norm,
-            'state': state_vec
+            'state': state
         }

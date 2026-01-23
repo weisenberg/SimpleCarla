@@ -75,6 +75,10 @@ class SimpleCarlaEnv(gym.Env):
                 all_lights.extend(c.get_lights())
             self.traffic_manager.set_lights(all_lights)
             
+            # Explicitly disable traffic if density is 'no' or 'none'
+            if self.traffic_density in [None, 'no', 'none']:
+                self.enable_traffic = False
+            
             if self.enable_traffic:
                 count = 70
                 if self.traffic_density == "low": count = 15
@@ -135,9 +139,11 @@ class SimpleCarlaEnv(gym.Env):
         # Observation Config
         self.obs_size = 84 # Standard RL Input Size
         
-        # Placeholder Action/Obs (Modified observation space from snippet)
-        # MultiDiscrete([3, 3]) -> [Throttle (0,1,2), Steer (0,1,2)]
-        self.action_space = spaces.MultiDiscrete([3, 3])
+        # Continuous Action Space: [Steering, Throttle/Brake]
+        # Action[0]: Steering (-1.0 to 1.0)
+        # Action[1]: Throttle/Brake (-1.0 to 1.0)
+        self.action_space = spaces.Box(low=np.array([-1, -1]), high=np.array([1, 1]), dtype=np.float32)
+        
         self.observation_space = spaces.Dict({
             'minimap': spaces.Box(low=0, high=255, shape=(self.obs_size, self.obs_size, 3), dtype=np.uint8),
             'lidar': spaces.Box(low=0.0, high=self.lidar_range, shape=(self.lidar_rays,), dtype=np.float32),
@@ -149,7 +155,9 @@ class SimpleCarlaEnv(gym.Env):
             'dist_to_left_boundary': spaces.Box(low=0, high=10.0, shape=(1,), dtype=np.float32),
             'dist_to_right_boundary': spaces.Box(low=0, high=10.0, shape=(1,), dtype=np.float32),
             'distance_to_lead': spaces.Box(low=0, high=100.0, shape=(1,), dtype=np.float32),
-            'traffic_light_state': spaces.Box(low=0, high=1.0, shape=(1,), dtype=np.float32),  # 0=Green/None, 1=Red
+            'traffic_light_state': spaces.Box(low=0, high=1.0, shape=(1,), dtype=np.float32),
+            # NAVIGATION
+            'target_point': spaces.Box(low=-100, high=100, shape=(2,), dtype=np.float32), # Local (x, y) to waypoint
         })
 
     def _spawn_ego(self):
@@ -199,9 +207,7 @@ class SimpleCarlaEnv(gym.Env):
         if options:
             if 'traffic' in options:
                 self.traffic_density = options['traffic']
-                self.enable_traffic = (self.traffic_density != 'no') # 'no' or None disables? assume 'no' means 0 cars but enabled flag?
-                # User said "various modes of traffic... like no to high"
-                # If traffic is 'no' or None, maybe we set enable_traffic=False?
+                # Synch enable_traffic with density
                 if self.traffic_density in [None, 'no', 'none']:
                     self.enable_traffic = False
                 else:
@@ -240,19 +246,14 @@ class SimpleCarlaEnv(gym.Env):
     def step(self, action):
         dt = 1.0/self.metadata["render_fps"]
         
-        # Apply Action to Ego (if discrete/dict passed from run_env)
-        # Apply Action to Ego (if discrete/dict passed from run_env)
-        # MultiDiscrete([3, 3])
-        # Action is array-like: [throttle_idx, steer_idx]
+        # Continuous Action Handling
         if self.enable_ego and self.ego_vehicle:
-            throttle_idx = action[0]
-            steer_idx = action[1]
+            # Action is [Steering, Throttle]
+            # Clip just in case
+            actions = np.clip(action, -1.0, 1.0)
             
-            # Throttle Mapping: 0->-1.0 (Rev), 1->0.0 (Idle), 2->1.0 (Fwd)
-            throttle = float(throttle_idx - 1)
-            
-            # Steering Mapping: 0->-1.0 (Left), 1->0.0 (Center), 2->1.0 (Right)
-            steering = float(steer_idx - 1)
+            steering = float(actions[0])
+            throttle = float(actions[1])
             
             self.ego_vehicle.apply_control(throttle, steering)
 
@@ -364,7 +365,9 @@ class SimpleCarlaEnv(gym.Env):
             'lateral_error': lat_err,
             'heading_error': head_err,
             'min_lidar_dist': min_lidar_dist,
-            'current_time': self.current_episode_time
+            'current_time': self.current_episode_time,
+            'action_accel': throttle,  # For braking reward
+            'action_steer': steering   # For potential future use
         }
         
         # Reward
